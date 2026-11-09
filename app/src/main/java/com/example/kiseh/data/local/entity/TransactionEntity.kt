@@ -11,6 +11,7 @@ data class TransactionEntity(
     val amount: Double,
     val type: String, // "INCOME" یا "EXPENSE"
     val category: String,
+    val bankName: String = "سایر",
     val date: Long,
     val smsBody: String? = null
 )
