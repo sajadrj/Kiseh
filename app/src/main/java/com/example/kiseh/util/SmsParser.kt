@@ -4,6 +4,7 @@ data class ParsedTransaction(
     val title: String,
     val amount: Double,
     val type: String, // "INCOME" یا "EXPENSE"
+    val category: String,
     val bankName: String,
     val rawMessage: String
 )
@@ -160,10 +161,29 @@ object SmsParser {
             else -> "برداشت وجه"
         }
 
+        val category = if (type == "INCOME") {
+            when {
+                text.contains("حقوق") || text.contains("دستمزد") -> "حقوق و درآمد"
+                text.contains("سود") || text.contains("سرمایه") -> "سود و سرمایه‌گذاری"
+                else -> "درآمد و واریزی"
+            }
+        } else {
+            when {
+                text.contains("خوراک") || text.contains("سوپر") || text.contains("هایپر") || text.contains("رستوران") || text.contains("فست فود") || text.contains("نانوا") || text.contains("کافه") -> "خوراک و سوپرمارکت"
+                text.contains("قبض") || text.contains("شارژ") || text.contains("آب") || text.contains("برق") || text.contains("گاز") || text.contains("تلفن") || text.contains("همراه") -> "قبوض و خدمات"
+                text.contains("اسنپ") || text.contains("تپسی") || text.contains("تاکسی") || text.contains("بنزین") || text.contains("پمپ") || text.contains("خودرو") || text.contains("پارکینگ") -> "حمل‌ونقل و خودرو"
+                text.contains("دارو") || text.contains("پزشک") || text.contains("بیمارستان") || text.contains("درمان") || text.contains("مطب") || text.contains("داروخانه") -> "سلامت و درمان"
+                text.contains("خرید") || text.contains("پوز") || text.contains("pos") || text.contains("فروشگاه") || text.contains("دیجی کالا") || text.contains("دیجیکالا") -> "خرید و بازار"
+                text.contains("پایا") || text.contains("ساتنا") || text.contains("پل") || text.contains("کارت به کارت") || text.contains("انتقال") || text.contains("حواله") -> "انتقال مالی"
+                else -> "سایر"
+            }
+        }
+
         return ParsedTransaction(
             title = title,
             amount = amount,
             type = type,
+            category = category,
             bankName = bankName,
             rawMessage = messageBody
         )

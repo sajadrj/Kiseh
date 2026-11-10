@@ -53,7 +53,7 @@ class SmsReceiver : BroadcastReceiver() {
                             title = parsed.title,
                             amount = parsed.amount,
                             type = parsed.type,
-                            category = "پیامک خودکار",
+                            category = parsed.category,
                             bankName = parsed.bankName,
                             date = System.currentTimeMillis(),
                             smsBody = parsed.rawMessage

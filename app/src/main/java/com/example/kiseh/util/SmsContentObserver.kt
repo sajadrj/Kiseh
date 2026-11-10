@@ -70,7 +70,7 @@ class SmsContentObserver(
                                     title = parsed.title,
                                     amount = parsed.amount,
                                     type = parsed.type,
-                                    category = "پیامک خودکار",
+                                    category = parsed.category,
                                     bankName = parsed.bankName,
                                     date = System.currentTimeMillis(),
                                     smsBody = parsed.rawMessage
@@ -135,7 +135,7 @@ class SmsContentObserver(
                                         title = parsed.title,
                                         amount = parsed.amount,
                                         type = parsed.type,
-                                        category = "همگام‌سازی پیامک",
+                                        category = parsed.category,
                                         bankName = parsed.bankName,
                                         date = date,
                                         smsBody = parsed.rawMessage
