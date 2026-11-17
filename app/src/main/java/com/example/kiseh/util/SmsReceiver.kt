@@ -13,6 +13,7 @@ import com.example.kiseh.data.local.entity.TransactionEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 class SmsReceiver : BroadcastReceiver() {
 
@@ -42,29 +43,45 @@ class SmsReceiver : BroadcastReceiver() {
 
             CoroutineScope(Dispatchers.IO).launch {
                 try {
+                    val database = AppDatabase.getDatabase(context)
+                    val ignoredBodies = database.ignoredSmsDao().getAllIgnoredSmsBodies()
+                    if (ignoredBodies.contains(fullBody)) {
+                        Log.d("KisehSMS", "⚠️ این پیامک قبلاً توسط کاربر حذف شده و نادیده گرفته شد.")
+                        return@launch
+                    }
+
                     val parsed = SmsParser.parseSms(fullBody, sender)
                     if (parsed != null) {
                         Log.d("KisehSMS", "✅ تراکنش با موفقیت شناسایی شد: عنوان=${parsed.title} | مبلغ=${parsed.amount} | نوع=${parsed.type}")
 
                         val database = AppDatabase.getDatabase(context)
                         val transactionDao = database.transactionDao()
+                        val existing = transactionDao.getAllTransactionsList()
 
-                        val transaction = TransactionEntity(
-                            title = parsed.title,
-                            amount = parsed.amount,
-                            type = parsed.type,
-                            category = parsed.category,
-                            bankName = parsed.bankName,
-                            date = System.currentTimeMillis(),
-                            smsBody = parsed.rawMessage
-                        )
-                        transactionDao.insertTransaction(transaction)
-                        Log.d("KisehSMS", "💾 تراکنش با موفقیت در دیتابیس ذخیره شد.")
+                        val isDuplicate = existing.any { tx ->
+                            (tx.smsBody != null && tx.smsBody == fullBody) ||
+                                    (tx.amount == parsed.amount && tx.title == parsed.title && abs(tx.date - System.currentTimeMillis()) < 120000L)
+                        }
 
-                        showToast(context, "✅ تراکنش ${parsed.amount} ریالی ذخیره شد!")
+                        if (!isDuplicate) {
+                            val transaction = TransactionEntity(
+                                title = parsed.title,
+                                amount = parsed.amount,
+                                type = parsed.type,
+                                category = parsed.category,
+                                bankName = parsed.bankName,
+                                date = System.currentTimeMillis(),
+                                smsBody = parsed.rawMessage
+                            )
+                            transactionDao.insertTransaction(transaction)
+                            Log.d("KisehSMS", "💾 تراکنش با موفقیت در دیتابیس ذخیره شد.")
+
+                            showToast(context, "✅ تراکنش ${parsed.amount} ریالی ذخیره شد!")
+                        } else {
+                            Log.d("KisehSMS", "⚠️ تراکنش تکراری است و ذخیره نشد.")
+                        }
                     } else {
                         Log.w("KisehSMS", "⚠️ پیامک دریافت شد اما الگوی تراکنش بانکی در آن پیدا نشد.")
-                        showToast(context, "⚠️ پیامک بانکی تشخیص داده نشد.")
                     }
                 } catch (e: Exception) {
                     Log.e("KisehSMS", "❌ خطا در پردازش یا ذخیره‌سازی پیامک", e)

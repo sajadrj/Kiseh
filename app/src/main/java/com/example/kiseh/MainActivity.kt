@@ -7,9 +7,13 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Telephony
 import android.widget.Toast
+import com.example.kiseh.data.local.entity.IgnoredSmsEntity
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -30,6 +34,8 @@ import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -49,11 +55,14 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.kiseh.data.local.entity.AppDatabase
 import com.example.kiseh.data.local.entity.TransactionEntity
+import com.example.kiseh.util.BackupManager
 import com.example.kiseh.util.BudgetManager
 import com.example.kiseh.util.SmsContentObserver
 import com.example.kiseh.util.SmsReceiver
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -86,9 +95,29 @@ class MainActivity : ComponentActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val granted = permissions[Manifest.permission.READ_SMS] == true || permissions[Manifest.permission.RECEIVE_SMS] == true
+        val granted = permissions[Manifest.permission.READ_SMS] == true
         if (granted) {
             Toast.makeText(this, "مجوز دسترسی به پیامک فعال شد", Toast.LENGTH_SHORT).show()
+            SmsContentObserver.syncAllBankSms(this) { count, _ ->
+                if (count > 0) {
+                    Toast.makeText(this, "📩 $count تراکنش جدید همگام‌سازی شد", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            Toast.makeText(this, "⚠️ دسترسی به پیامک رد شد. برای خواندن خودکار تراکنش‌ها نیاز به این مجوز است.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun checkAndRequestSmsPermissions(onGranted: () -> Unit) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) {
+            onGranted()
+        } else {
+            requestPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.READ_SMS,
+                    Manifest.permission.RECEIVE_SMS
+                )
+            )
         }
     }
 
@@ -98,23 +127,18 @@ class MainActivity : ComponentActivity() {
 
         smsContentObserver = SmsContentObserver(this)
 
-        // بررسی و درخواست مجوزهای خواندن، دریافت پیامک و نوتیفیکیشن
-        val permissionsToRequest = mutableListOf<String>()
+        // درخواست مجوز پیامک فقط برای اولین بار نصب
+        val prefs = getSharedPreferences("kiseh_prefs", MODE_PRIVATE)
+        val hasRequestedPermission = prefs.getBoolean("has_requested_sms_permission", false)
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
-            permissionsToRequest.add(Manifest.permission.READ_SMS)
-        }
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED) {
-            permissionsToRequest.add(Manifest.permission.RECEIVE_SMS)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-
-        if (permissionsToRequest.isNotEmpty()) {
-            requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
+        if (!hasRequestedPermission && ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+            prefs.edit().putBoolean("has_requested_sms_permission", true).apply()
+            requestPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.READ_SMS,
+                    Manifest.permission.RECEIVE_SMS
+                )
+            )
         }
 
         val database = AppDatabase.getDatabase(this)
@@ -126,6 +150,47 @@ class MainActivity : ComponentActivity() {
                     val transactions by transactionDao.getAllTransactions().collectAsState(initial = emptyList())
                     var showDialog by remember { mutableStateOf(false) }
                     val coroutineScope = rememberCoroutineScope()
+                    val context = LocalContext.current
+
+                    val backupManager = remember { BackupManager(context) }
+
+                    val exportLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.CreateDocument("application/json")
+                    ) { uri ->
+                        uri?.let {
+                            coroutineScope.launch {
+                                val allTxs = transactionDao.getAllTransactionsList()
+                                val success = backupManager.exportBackup(it, allTxs)
+                                Toast.makeText(
+                                    context,
+                                    if (success) "فایل پشتیبان با موفقیت ذخیره شد" else "خطا در تهیه پشتیبان",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    }
+
+                    val importLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.OpenDocument()
+                    ) { uri ->
+                        uri?.let {
+                            coroutineScope.launch {
+                                val imported = backupManager.importBackup(it)
+                                if (!imported.isNullOrEmpty()) {
+                                    transactionDao.insertAllTransactions(imported)
+                                    Toast.makeText(
+                                        context,
+                                        "اطلاعات با موفقیت بازگردانی شد (${imported.size} تراکنش)",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    Toast.makeText(context, "فایل نامعتبر است یا خالی بود", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    }
+
+                    var showBulkDeleteDialog by remember { mutableStateOf(false) }
 
                     Scaffold(
                         modifier = Modifier
@@ -148,7 +213,91 @@ class MainActivity : ComponentActivity() {
                                     transactions = transactions,
                                     onDeleteTransaction = { idToDelete ->
                                         coroutineScope.launch(Dispatchers.IO) {
-                                            transactionDao.deleteTransactionById(idToDelete)
+                                            val database = AppDatabase.getDatabase(context)
+                                            val tx = database.transactionDao().getTransactionById(idToDelete)
+                                            if (tx != null && !tx.smsBody.isNullOrBlank()) {
+                                                database.ignoredSmsDao().insertIgnoredSms(IgnoredSmsEntity(tx.smsBody))
+                                            }
+                                            database.transactionDao().deleteTransactionById(idToDelete)
+                                        }
+                                    },
+                                    onUpdateTransaction = { txToUpdate ->
+                                        coroutineScope.launch(Dispatchers.IO) {
+                                            AppDatabase.getDatabase(context).transactionDao().updateTransaction(txToUpdate)
+                                        }
+                                    },
+                                    onBackupClick = {
+                                        exportLauncher.launch("kiseh_backup_${System.currentTimeMillis()}.json")
+                                    },
+                                    onRestoreClick = {
+                                        importLauncher.launch(arrayOf("application/json", "*/*"))
+                                    },
+                                    onSyncSmsClick = {
+                                        checkAndRequestSmsPermissions {
+                                            SmsContentObserver.syncAllBankSms(context) { count, isFirstTime ->
+                                                when {
+                                                    isFirstTime -> {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "چون اولین بار است استفاده می‌کنید، تراکنش‌های یک هفته گذشته اضافه شد ($count تراکنش)",
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                                    count > 0 -> {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "✅ $count تراکنش جدید همگام‌سازی شد",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
+                                                    else -> {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "هیچ تراکنش جدیدی یافت نشد",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    onBulkDeleteClick = {
+                                        showBulkDeleteDialog = true
+                                    }
+                                )
+                            }
+
+                            if (showBulkDeleteDialog) {
+                                BulkDeleteDialog(
+                                    onDismiss = { showBulkDeleteDialog = false },
+                                    onDeleteRange = { start, end ->
+                                        coroutineScope.launch(Dispatchers.IO) {
+                                            val database = AppDatabase.getDatabase(context)
+                                            val txs = database.transactionDao().getTransactionsBetween(start, end)
+                                            for (tx in txs) {
+                                                if (!tx.smsBody.isNullOrBlank()) {
+                                                    database.ignoredSmsDao().insertIgnoredSms(IgnoredSmsEntity(tx.smsBody))
+                                                }
+                                            }
+                                            database.transactionDao().deleteTransactionsBetween(start, end)
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(context, "تراکنش‌های بازه انتخابی حذف شدند", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    },
+                                    onDeleteAll = {
+                                        coroutineScope.launch(Dispatchers.IO) {
+                                            val database = AppDatabase.getDatabase(context)
+                                            val txs = database.transactionDao().getTransactionsBetween(0L, System.currentTimeMillis() + 86400000L)
+                                            for (tx in txs) {
+                                                if (!tx.smsBody.isNullOrBlank()) {
+                                                    database.ignoredSmsDao().insertIgnoredSms(IgnoredSmsEntity(tx.smsBody))
+                                                }
+                                            }
+                                            database.transactionDao().deleteTransactionsBetween(0L, System.currentTimeMillis() + 86400000L)
+                                            withContext(Dispatchers.Main) {
+                                                Toast.makeText(context, "تمام تراکنش‌ها حذف شدند", Toast.LENGTH_SHORT).show()
+                                            }
                                         }
                                     }
                                 )
@@ -193,6 +342,15 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
         }
 
+        // همگام‌سازی خودکار هنگام ورود به برنامه (اگر خالی باشد از زمان اولین ورود، اگر پر باشد از آخرین تراکنش)
+        SmsContentObserver.syncAllBankSms(this) { count, _ ->
+            if (count > 0) {
+                runOnUiThread {
+                    Toast.makeText(this, "📩 $count تراکنش جدید از پیامک‌ها همگام‌سازی شد", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
         val filter = IntentFilter(Telephony.Sms.Intents.SMS_RECEIVED_ACTION).apply {
             priority = 999
         }
@@ -220,6 +378,27 @@ fun formatRial(amount: Double): String {
         formatter.format(amount) + " ریال"
     } catch (e: Exception) {
         "${amount.toLong()} ریال"
+    }
+}
+
+fun formatDateTime(timestamp: Long): String {
+    return try {
+        val calendar = Calendar.getInstance().apply { timeInMillis = timestamp }
+        val gYear = calendar.get(Calendar.YEAR)
+        val gMonth = calendar.get(Calendar.MONTH) + 1
+        val gDay = calendar.get(Calendar.DAY_OF_MONTH)
+        val hour = calendar.get(Calendar.HOUR_OF_DAY)
+        val minute = calendar.get(Calendar.MINUTE)
+
+        val (jY, jM, jD) = gregorianToJalali(gYear, gMonth, gDay)
+        val jMonthStr = if (jM < 10) "0$jM" else "$jM"
+        val jDayStr = if (jD < 10) "0$jD" else "$jD"
+        val hourStr = if (hour < 10) "0$hour" else "$hour"
+        val minStr = if (minute < 10) "0$minute" else "$minute"
+
+        "$jY/$jMonthStr/$jDayStr - $hourStr:$minStr"
+    } catch (e: Exception) {
+        ""
     }
 }
 
@@ -386,17 +565,23 @@ fun CategoryPieChart(
 @Composable
 fun MainScreen(
     transactions: List<TransactionEntity>,
-    onDeleteTransaction: (Long) -> Unit
+    onDeleteTransaction: (Long) -> Unit,
+    onUpdateTransaction: (TransactionEntity) -> Unit,
+    onBackupClick: () -> Unit,
+    onRestoreClick: () -> Unit,
+    onSyncSmsClick: () -> Unit,
+    onBulkDeleteClick: () -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(0) } // 0: Transactions, 1: Statistics
     var showAboutDialog by remember { mutableStateOf(false) }
+    var showMenu by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp)
     ) {
-        // هدر شیک و مدرن برنامه با آیکون آدمک در سمت چپ
+        // هدر برنامه با دکمه منو و پروفایل
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -417,18 +602,73 @@ fun MainScreen(
                 )
             }
 
-            // آیکون آدمک (پروفایل / درباره توسعه‌دهنده)
-            IconButton(
-                onClick = { showAboutDialog = true },
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.Person,
-                    contentDescription = "درباره توسعه‌دهنده",
-                    tint = MaterialTheme.colorScheme.primary
-                )
+                // منوی گزینه‌ها (بکاپ و ریستور)
+                Box {
+                    IconButton(
+                        onClick = { showMenu = true },
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "منوی تنظیمات و پشتیبان‌گیری",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("پشتیبان‌گیری از اطلاعات (Export)") },
+                            onClick = {
+                                showMenu = false
+                                onBackupClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("بازگردانی اطلاعات (Restore)") },
+                            onClick = {
+                                showMenu = false
+                                onRestoreClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("همگام‌سازی پیامک‌ها (Sync SMS)") },
+                            onClick = {
+                                showMenu = false
+                                onSyncSmsClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("حذف دسته‌جمعی تراکنش‌ها") },
+                            onClick = {
+                                showMenu = false
+                                onBulkDeleteClick()
+                            }
+                        )
+                    }
+                }
+
+                // آیکون پروفایل توسعه‌دهنده
+                IconButton(
+                    onClick = { showAboutDialog = true },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primaryContainer)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Person,
+                        contentDescription = "درباره توسعه‌دهنده",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
 
@@ -454,7 +694,7 @@ fun MainScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         when (selectedTab) {
-            0 -> TransactionsTab(transactions, onDeleteTransaction)
+            0 -> TransactionsTab(transactions, onDeleteTransaction, onUpdateTransaction)
             1 -> StatisticsTab(transactions)
         }
 
@@ -480,11 +720,13 @@ fun MainScreen(
 @Composable
 fun TransactionsTab(
     transactions: List<TransactionEntity>,
-    onDeleteTransaction: (Long) -> Unit
+    onDeleteTransaction: (Long) -> Unit,
+    onUpdateTransaction: (TransactionEntity) -> Unit
 ) {
     var selectedBank by remember { mutableStateOf("همه بانک‌ها") }
     var selectedCategory by remember { mutableStateOf("همه دسته‌ها") }
     var searchQuery by remember { mutableStateOf("") }
+    var editingTransaction by remember { mutableStateOf<TransactionEntity?>(null) }
 
     val totalIncome = transactions.filter { it.type == "INCOME" }.sumOf { it.amount }
     val totalExpense = transactions.filter { it.type == "EXPENSE" }.sumOf { it.amount }
@@ -516,56 +758,6 @@ fun TransactionsTab(
             shape = RoundedCornerShape(16.dp),
             singleLine = true
         )
-
-        // کارت خلاصه آمار و مجموع مبالغ با طراحی مدرن
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp),
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text(
-                    text = "خلاصه وضعیت مالی",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-                HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column {
-                        Text(text = "کل واریزی‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                        Text(text = formatRial(totalIncome), color = Color(0xFF047857), style = MaterialTheme.typography.bodyMedium)
-                    }
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(text = "کل برداشت‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                        Text(text = formatRial(totalExpense), color = Color(0xFFDC2626), style = MaterialTheme.typography.bodyMedium)
-                    }
-                }
-                Spacer(modifier = Modifier.height(2.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(text = "موجودی خالص کل:", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                    Text(
-                        text = formatRial(netBalance),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (netBalance >= 0) Color(0xFF047857) else Color(0xFFDC2626)
-                    )
-                }
-            }
-        }
 
         // نوار انتخاب دسته‌بندی و بانک (Filter Chips)
         Column(
@@ -687,21 +879,35 @@ fun TransactionsTab(
                                     color = amountColor
                                 )
                                 Text(
-                                    text = if (isIncome) "واریز" else "برداشت",
+                                    text = "${if (isIncome) "واریز" else "برداشت"} | ${formatDateTime(tx.date)}",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = amountColor
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
 
-                            // دکمه حذف (آیکون سطل زباله)
-                            IconButton(
-                                onClick = { onDeleteTransaction(tx.id) }
+                            // دکمه ویرایش و حذف
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Delete,
-                                    contentDescription = "حذف تراکنش",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                                )
+                                IconButton(
+                                    onClick = { editingTransaction = tx }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Edit,
+                                        contentDescription = "ویرایش تراکنش",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onDeleteTransaction(tx.id) }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "حذف تراکنش",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                    )
+                                }
                             }
                         }
                     }
@@ -709,12 +915,185 @@ fun TransactionsTab(
             }
         }
     }
+
+    if (editingTransaction != null) {
+        EditTransactionDialog(
+            transaction = editingTransaction!!,
+            onDismiss = { editingTransaction = null },
+            onSave = { updated ->
+                onUpdateTransaction(updated)
+                editingTransaction = null
+            }
+        )
+    }
+}
+
+@Composable
+fun EditTransactionDialog(
+    transaction: TransactionEntity,
+    onDismiss: () -> Unit,
+    onSave: (TransactionEntity) -> Unit
+) {
+    var title by remember { mutableStateOf(transaction.title) }
+    var amountStr by remember { mutableStateOf(transaction.amount.toLong().toString()) }
+    var category by remember { mutableStateOf(transaction.category) }
+    var bankName by remember { mutableStateOf(transaction.bankName) }
+    val isIncome = transaction.type == "INCOME"
+
+    val expenseCategories = listOf(
+        "خوراک و سوپرمارکت",
+        "خرید و بازار",
+        "قبوض و خدمات",
+        "حمل‌ونقل و خودرو",
+        "سلامت و درمان",
+        "انتقال مالی",
+        "سایر"
+    )
+
+    val incomeCategories = listOf(
+        "حقوق و درآمد",
+        "سود و سرمایه‌گذاری",
+        "درآمد و واریزی",
+        "سایر"
+    )
+
+    val availableCategories = if (isIncome) incomeCategories else expenseCategories
+
+    val banks = listOf(
+        "بانک ملی",
+        "بانک ملت",
+        "بانک صادرات",
+        "بانک سپه",
+        "بانک تجارت",
+        "بانک پاسارگاد",
+        "بانک سامان",
+        "بانک کشاورزی",
+        "بانک مسکن",
+        "بانک رفاه کارگران",
+        "بانک شهر",
+        "بانک دی",
+        "بانک آینده",
+        "بانک رسالت",
+        "بانک مهر ایران",
+        "بانک پارسیان",
+        "بانک اقتصاد نوین",
+        "بانک سینا",
+        "بانک کارآفرین",
+        "بانک گردشگری",
+        "پست بانک ایران",
+        "بلو بانک",
+        "سایر"
+    )
+
+    var bankExpanded by remember { mutableStateOf(false) }
+    var categoryExpanded by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("ویرایش تراکنش و دسته‌بندی") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("عنوان / پذیرنده") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = amountStr,
+                    onValueChange = { amountStr = it },
+                    label = { Text("مبلغ (ریال)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // انتخاب دسته‌بندی
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { categoryExpanded = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("دسته‌بندی: $category")
+                    }
+                    DropdownMenu(
+                        expanded = categoryExpanded,
+                        onDismissRequest = { categoryExpanded = false },
+                        modifier = Modifier.heightIn(max = 250.dp)
+                    ) {
+                        availableCategories.forEach { cat ->
+                            DropdownMenuItem(
+                                text = { Text(cat) },
+                                onClick = {
+                                    category = cat
+                                    categoryExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // انتخاب بانک
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { bankExpanded = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("بانک: $bankName")
+                    }
+                    DropdownMenu(
+                        expanded = bankExpanded,
+                        onDismissRequest = { bankExpanded = false },
+                        modifier = Modifier.heightIn(max = 250.dp)
+                    ) {
+                        banks.forEach { b ->
+                            DropdownMenuItem(
+                                text = { Text(b) },
+                                onClick = {
+                                    bankName = b
+                                    bankExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val amount = amountStr.replace(",", "").replace("٬", "").toDoubleOrNull() ?: transaction.amount
+                    if (title.isNotBlank() && amount > 0) {
+                        onSave(
+                            transaction.copy(
+                                title = title,
+                                amount = amount,
+                                category = category,
+                                bankName = bankName
+                            )
+                        )
+                    }
+                }
+            ) {
+                Text("ذخیره")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("لغو")
+            }
+        }
+    )
 }
 
 @Composable
 fun StatisticsTab(transactions: List<TransactionEntity>) {
     var timeFrame by remember { mutableStateOf("ماه") } // "روز", "ماه", "سال"
     var categoryTypeFilter by remember { mutableStateOf("EXPENSE") } // "EXPENSE" یا "INCOME"
+
+    var dialogTitle by remember { mutableStateOf<String?>(null) }
+    var dialogTransactions by remember { mutableStateOf<List<TransactionEntity>>(emptyList()) }
+
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
 
     val pattern = when (timeFrame) {
         "روز" -> "yyyy/MM/dd"
@@ -723,11 +1102,18 @@ fun StatisticsTab(transactions: List<TransactionEntity>) {
         else -> "yyyy/MM"
     }
 
-    val totalIncome = transactions.filter { it.type == "INCOME" }.sumOf { it.amount }
-    val totalExpense = transactions.filter { it.type == "EXPENSE" }.sumOf { it.amount }
+    // گروه‌بندی بر اساس بازه زمانی (روز، ماه، سال)
+    val groupedByPeriod = transactions.groupBy { formatDate(it.date, pattern) }.toSortedMap(reverseOrder())
 
-    // تفکیک بر اساس دسته‌بندی با کوئری / گروه‌بندی
-    val categoryTotals = transactions
+    // همیشه بازه زمانی واقعیِ جاری (امروز، ماه جاری، یا سال جاری سیستم)
+    val currentPeriodKey = formatDate(System.currentTimeMillis(), pattern)
+    val periodTransactions = groupedByPeriod[currentPeriodKey] ?: emptyList()
+
+    val totalIncome = periodTransactions.filter { it.type == "INCOME" }.sumOf { it.amount }
+    val totalExpense = periodTransactions.filter { it.type == "EXPENSE" }.sumOf { it.amount }
+
+    // تفکیک بر اساس دسته‌بندی در این بازه
+    val categoryTotals = periodTransactions
         .filter { it.type == categoryTypeFilter }
         .groupBy { it.category }
         .mapValues { entry -> entry.value.sumOf { it.amount } }
@@ -736,143 +1122,72 @@ fun StatisticsTab(transactions: List<TransactionEntity>) {
 
     val categoryTotalSum = categoryTotals.sumOf { it.second }
 
-    // تفکیک بر اساس بانک
-    val bankTotals = transactions.groupBy { it.bankName }.mapValues { entry ->
+    // تفکیک بر اساس بانک در این بازه
+    val bankTotals = periodTransactions.groupBy { it.bankName }.mapValues { entry ->
         val inc = entry.value.filter { it.type == "INCOME" }.sumOf { it.amount }
         val exp = entry.value.filter { it.type == "EXPENSE" }.sumOf { it.amount }
         inc - exp
     }
 
-    // گروه‌بندی بر اساس بازه زمانی (روز، ماه، سال)
-    val groupedByPeriod = transactions.groupBy { formatDate(it.date, pattern) }.toSortedMap(reverseOrder())
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
-            .fillMaxHeight(),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            // انتخاب بازه زمانی (روز، ماه، سال)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                listOf("روز", "ماه", "سال").forEach { tf ->
-                    FilterChip(
-                        selected = timeFrame == tf,
-                        onClick = { timeFrame = tf },
-                        label = { Text("بر اساس $tf") },
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                }
-            }
-        }
-
-        item {
-            // کارت خلاصه کل
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(20.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+    Box(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                // انتخاب بازه زمانی (روز، ماه، سال)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(text = "آمار کلی ($timeFrame)", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                    HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column {
-                            Text(text = "کل واریزی‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                            Text(text = formatRial(totalIncome), color = Color(0xFF047857), style = MaterialTheme.typography.bodyMedium)
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(text = "کل برداشت‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                            Text(text = formatRial(totalExpense), color = Color(0xFFDC2626), style = MaterialTheme.typography.bodyMedium)
-                        }
-                    }
-                }
-            }
-        }
-
-        item {
-            // کارت نمودار دایره‌ای دسته‌بندی هزینه‌ها و درآمدها
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "📊 نمودار دسته‌بندی تراکنش‌ها",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.primary
+                    listOf("روز", "ماه", "سال").forEach { tf ->
+                        FilterChip(
+                            selected = timeFrame == tf,
+                            onClick = { timeFrame = tf },
+                            label = { Text(tf) },
+                            shape = RoundedCornerShape(12.dp)
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            FilterChip(
-                                selected = categoryTypeFilter == "EXPENSE",
-                                onClick = { categoryTypeFilter = "EXPENSE" },
-                                label = { Text("هزینه‌ها") },
-                                shape = RoundedCornerShape(12.dp)
-                            )
-                            FilterChip(
-                                selected = categoryTypeFilter == "INCOME",
-                                onClick = { categoryTypeFilter = "INCOME" },
-                                label = { Text("درآمدها") },
-                                shape = RoundedCornerShape(12.dp)
-                            )
-                        }
                     }
+                }
+            }
 
-                    HorizontalDivider()
-
-                    // رسم نمودار دایره‌ای
-                    CategoryPieChart(
-                        categoryTotals = categoryTotals,
-                        totalAmount = categoryTotalSum,
-                        modifier = Modifier.padding(vertical = 8.dp)
-                    )
-
-                    // راهنما و لیست جزئیات هر دسته همراه با بودجه
-                    if (categoryTotals.isNotEmpty() && categoryTotalSum > 0) {
-                        Column(
+            item {
+                // کارت خلاصه کل
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Text(text = "آمار کلی ($timeFrame)", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        HorizontalDivider(color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.2f))
+                        Row(
                             modifier = Modifier.fillMaxWidth(),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            categoryTotals.forEach { (catName, amount) ->
-                                CategoryBudgetRow(
-                                    categoryName = catName,
-                                    timeFrame = timeFrame,
-                                    spentAmount = amount,
-                                    totalExpense = categoryTotalSum
-                                )
+                            Column {
+                                Text(text = "کل واریزی‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                Text(text = formatRial(totalIncome), color = Color(0xFF047857), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text(text = "کل برداشت‌ها:", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                Text(text = formatRial(totalExpense), color = Color(0xFFDC2626), style = MaterialTheme.typography.bodyMedium)
                             }
                         }
                     }
                 }
             }
-        }
 
-        item {
-            // نمودار تفکیک بانک‌ها
-            if (bankTotals.isNotEmpty()) {
+            item {
+                // کارت نمودار دایره‌ای دسته‌بندی هزینه‌ها و درآمدها
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(20.dp),
@@ -882,91 +1197,269 @@ fun StatisticsTab(transactions: List<TransactionEntity>) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(text = "📊 تفکیک موجودی بانک‌ها", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-                        HorizontalDivider()
-                        bankTotals.forEach { (bank, balance) ->
-                            val maxAbs = bankTotals.values.maxOfOrNull { abs(it) } ?: 1.0
-                            val progress = (abs(balance) / if (maxAbs == 0.0) 1.0 else maxAbs).toFloat().coerceIn(0.1f, 1.0f)
-
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(text = bank, style = MaterialTheme.typography.bodySmall)
-                                    Text(
-                                        text = formatRial(balance),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = if (balance >= 0) Color(0xFF047857) else Color(0xFFDC2626)
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "📊 نمودار دسته‌بندی تراکنش‌ها",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    FilterChip(
+                                        selected = categoryTypeFilter == "EXPENSE",
+                                        onClick = { categoryTypeFilter = "EXPENSE" },
+                                        label = { Text("هزینه‌ها") },
+                                        shape = RoundedCornerShape(12.dp)
+                                    )
+                                    FilterChip(
+                                        selected = categoryTypeFilter == "INCOME",
+                                        onClick = { categoryTypeFilter = "INCOME" },
+                                        label = { Text("درآمدها") },
+                                        shape = RoundedCornerShape(12.dp)
                                     )
                                 }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                LinearProgressIndicator(
-                                    progress = { progress },
+                            }
+                        }
+
+                        HorizontalDivider()
+
+                        // رسم نمودار دایره‌ای
+                        CategoryPieChart(
+                            categoryTotals = categoryTotals,
+                            totalAmount = categoryTotalSum,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+
+                        // راهنما و لیست جزئیات هر دسته همراه با بودجه
+                        if (categoryTotals.isNotEmpty() && categoryTotalSum > 0) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                categoryTotals.forEach { (catName, amount) ->
+                                    CategoryBudgetRow(
+                                        categoryName = catName,
+                                        timeFrame = timeFrame,
+                                        spentAmount = amount,
+                                        totalExpense = categoryTotalSum,
+                                        onClickTransactions = {
+                                            dialogTitle = "تراکنش‌های دسته‌بندی: $catName ($timeFrame)"
+                                            dialogTransactions = periodTransactions.filter { it.category == catName && it.type == categoryTypeFilter }
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                // نمودار تفکیک بانک‌ها
+                if (bankTotals.isNotEmpty()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(text = "📊 تفکیک موجودی بانک‌ها", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+                            HorizontalDivider()
+                            bankTotals.forEach { (bank, balance) ->
+                                val maxAbs = bankTotals.values.maxOfOrNull { abs(it) } ?: 1.0
+                                val progress = (abs(balance) / if (maxAbs == 0.0) 1.0 else maxAbs).toFloat().coerceIn(0.1f, 1.0f)
+
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(8.dp)
-                                        .clip(RoundedCornerShape(4.dp)),
-                                    color = if (balance >= 0) Color(0xFF10B981) else Color(0xFFF87171),
-                                )
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable {
+                                            dialogTitle = "تراکنش‌های بانک: $bank"
+                                            dialogTransactions = periodTransactions.filter { it.bankName == bank }
+                                        }
+                                        .padding(vertical = 4.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(text = bank, style = MaterialTheme.typography.bodySmall)
+                                        Text(
+                                            text = formatRial(balance),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (balance >= 0) Color(0xFF047857) else Color(0xFFDC2626)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    LinearProgressIndicator(
+                                        progress = { progress },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(8.dp)
+                                            .clip(RoundedCornerShape(4.dp)),
+                                        color = if (balance >= 0) Color(0xFF10B981) else Color(0xFFF87171),
+                                    )
+                                }
                             }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Text(
+                    text = "📅 گزارش تفکیک‌شده بر اساس $timeFrame",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+
+            items(groupedByPeriod.entries.toList()) { (period, txList) ->
+                val periodIncome = txList.filter { it.type == "INCOME" }.sumOf { it.amount }
+                val periodExpense = txList.filter { it.type == "EXPENSE" }.sumOf { it.amount }
+                val periodNet = periodIncome - periodExpense
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            dialogTitle = "تراکنش‌های بازه: $period ($timeFrame)"
+                            dialogTransactions = txList
+                        },
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(text = "بازه: $period", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
+                            Text(
+                                text = formatRial(periodNet),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (periodNet >= 0) Color(0xFF047857) else Color(0xFFDC2626)
+                            )
+                        }
+                        Text(text = "تعداد تراکنش: ${txList.size}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(text = "واریز: ${formatRial(periodIncome)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF047857))
+                            Text(text = "برداشت: ${formatRial(periodExpense)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFDC2626))
                         }
                     }
                 }
             }
         }
 
-        item {
-            Text(
-                text = "📅 گزارش تفکیک‌شده بر اساس $timeFrame",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.padding(top = 8.dp)
+        if (dialogTitle != null) {
+            DetailsTransactionsDialog(
+                title = dialogTitle!!,
+                transactions = dialogTransactions,
+                onDismiss = { dialogTitle = null },
+                onDeleteTransaction = { id ->
+                    coroutineScope.launch(Dispatchers.IO) {
+                        val database = AppDatabase.getDatabase(context)
+                        val tx = database.transactionDao().getTransactionById(id)
+                        if (tx != null && !tx.smsBody.isNullOrBlank()) {
+                            database.ignoredSmsDao().insertIgnoredSms(IgnoredSmsEntity(tx.smsBody))
+                        }
+                        database.transactionDao().deleteTransactionById(id)
+                        dialogTransactions = dialogTransactions.filter { it.id != id }
+                    }
+                }
             )
         }
+    }
+}
 
-        items(groupedByPeriod.entries.toList()) { (period, txList) ->
-            val periodIncome = txList.filter { it.type == "INCOME" }.sumOf { it.amount }
-            val periodExpense = txList.filter { it.type == "EXPENSE" }.sumOf { it.amount }
-            val periodNet = periodIncome - periodExpense
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-            ) {
-                Column(
+@Composable
+fun DetailsTransactionsDialog(
+    title: String,
+    transactions: List<TransactionEntity>,
+    onDismiss: () -> Unit,
+    onDeleteTransaction: (Long) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(text = title, style = MaterialTheme.typography.titleMedium)
+        },
+        text = {
+            if (transactions.isEmpty()) {
+                Text("تراکنشی در این بخش وجود ندارد.")
+            } else {
+                LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                        .height(400.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(text = "بازه: $period", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.primary)
-                        Text(
-                            text = formatRial(periodNet),
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = if (periodNet >= 0) Color(0xFF047857) else Color(0xFFDC2626)
-                        )
-                    }
-                    Text(text = "تعداد تراکنش: ${txList.size}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(text = "واریز: ${formatRial(periodIncome)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF047857))
-                        Text(text = "برداشت: ${formatRial(periodExpense)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFDC2626))
+                    items(transactions, key = { it.id }) { tx ->
+                        val isIncome = tx.type == "INCOME"
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(text = tx.title, style = MaterialTheme.typography.bodyMedium)
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = formatRial(tx.amount),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (isIncome) Color(0xFF047857) else Color(0xFFDC2626)
+                                    )
+                                    Text(
+                                        text = "${tx.category} | ${tx.bankName} | ${formatDateTime(tx.date)}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                IconButton(onClick = { onDeleteTransaction(tx.id) }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "حذف", tint = Color(0xFFDC2626))
+                                }
+                            }
+                        }
                     }
                 }
             }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("بستن")
+            }
         }
-    }
+    )
 }
 
 @Composable
@@ -1315,7 +1808,8 @@ fun CategoryBudgetRow(
     categoryName: String,
     timeFrame: String,
     spentAmount: Double,
-    totalExpense: Double
+    totalExpense: Double,
+    onClickTransactions: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val budgetManager = remember { BudgetManager(context) }
@@ -1336,7 +1830,7 @@ fun CategoryBudgetRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable { showBudgetDialog = true }
+            .clickable { onClickTransactions() }
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f))
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -1348,7 +1842,8 @@ fun CategoryBudgetRow(
         ) {
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
             ) {
                 Box(
                     modifier = Modifier
@@ -1365,7 +1860,7 @@ fun CategoryBudgetRow(
             }
 
             Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(horizontalAlignment = Alignment.End) {
@@ -1389,7 +1884,6 @@ fun CategoryBudgetRow(
                     }
                 }
 
-                // آیکن تنظیمات/ویرایش بودجه که همیشه نمایش داده می‌شود
                 IconButton(
                     onClick = { showBudgetDialog = true },
                     modifier = Modifier.size(32.dp)
@@ -1411,8 +1905,8 @@ fun CategoryBudgetRow(
                 .height(6.dp)
                 .clip(RoundedCornerShape(3.dp)),
             color = when {
-                isExceeded -> Color(0xFFDC2626) // قرمز هشدار عبور از بودجه
-                isNearLimit -> Color(0xFFF59E0B) // نارنجی نزدیک به سقف بودجه
+                isExceeded -> Color(0xFFDC2626)
+                isNearLimit -> Color(0xFFF59E0B)
                 else -> catColor
             },
             trackColor = catColor.copy(alpha = 0.15f)
@@ -1503,6 +1997,88 @@ fun SetBudgetDialog(
     )
 }
 
+@Composable
+fun BulkDeleteDialog(
+    onDismiss: () -> Unit,
+    onDeleteRange: (Long, Long) -> Unit,
+    onDeleteAll: () -> Unit
+) {
+    var selectedOption by remember { mutableStateOf("یک ماه اخیر") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("حذف دسته‌جمعی تراکنش‌ها") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "لطفاً بازه زمانی مورد نظر برای حذف تراکنش‌ها را انتخاب کنید:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                val options = listOf("امروز", "یک هفته اخیر", "یک ماه اخیر", "همه تراکنش‌ها")
+                options.forEach { opt ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedOption = opt }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        RadioButton(
+                            selected = selectedOption == opt,
+                            onClick = { selectedOption = opt }
+                        )
+                        Text(text = opt, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val calendar = Calendar.getInstance()
+                    val endTime = calendar.timeInMillis
+                    val startTime = when (selectedOption) {
+                        "امروز" -> {
+                            calendar.set(Calendar.HOUR_OF_DAY, 0)
+                            calendar.set(Calendar.MINUTE, 0)
+                            calendar.set(Calendar.SECOND, 0)
+                            calendar.timeInMillis
+                        }
+                        "یک هفته اخیر" -> {
+                            calendar.add(Calendar.DAY_OF_YEAR, -7)
+                            calendar.timeInMillis
+                        }
+                        "یک ماه اخیر" -> {
+                            calendar.add(Calendar.MONTH, -1)
+                            calendar.timeInMillis
+                        }
+                        else -> 0L
+                    }
+
+                    if (selectedOption == "همه تراکنش‌ها") {
+                        onDeleteAll()
+                    } else {
+                        onDeleteRange(startTime, endTime)
+                    }
+                    onDismiss()
+                },
+                colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFDC2626))
+            ) {
+                Text("تایید و حذف")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("لغو")
+            }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+
 @Preview(showBackground = true, showSystemUi = true)
 @Composable
 fun MainScreenPreview() {
@@ -1513,7 +2089,12 @@ fun MainScreenPreview() {
         )
         MainScreen(
             transactions = sampleTransactions,
-            onDeleteTransaction = {}
+            onDeleteTransaction = {},
+            onUpdateTransaction = {},
+            onBackupClick = {},
+            onRestoreClick = {},
+            onSyncSmsClick = {},
+            onBulkDeleteClick = {}
         )
     }
 }

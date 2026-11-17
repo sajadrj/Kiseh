@@ -28,6 +28,19 @@ object SmsParser {
         val senderLower = normalizedSender.lowercase()
         val isSenderNumeric = normalizedSender.all { it.isDigit() || it == '+' || it == '-' || it == ' ' }
 
+        // فیلتر جامع پیامک‌های تبلیغاتی، پیشنهادات خرید بسته اینترنت، اپراتورها و وام
+        if (text.contains("بسته مخصوص") || text.contains("بسته ویژه") ||
+            text.contains("پیشنهاد ویژه") || text.contains("آخر ماه پرداخت") ||
+            text.contains("پولش رو بعدا") || text.contains("پولش رو بعداً") ||
+            text.contains("فعال کن") || text.contains("خرید بسته") ||
+            text.contains("هدیه") || text.contains("قرعه کشی") ||
+            text.contains("برنده") || text.contains("وام") ||
+            text.contains("ایرانسل من") || text.contains("همراه من") ||
+            text.contains("http") || text.contains("www.") ||
+            text.contains("کلیک کنید")) {
+            return null
+        }
+
         // تشخیص دقیق نام بانک (بررسی متن پیامک و در صورت نیاز نام فرستنده)
         val bankName = when {
             // ۱. بررسی متن پیامک (اولویت اول برای تشخیص نام بانک از داخل متن)
@@ -75,6 +88,28 @@ object SmsParser {
             else -> "سایر"
         }
 
+        // فیلتر پیامک‌های رمز پویا، رمز یکبار مصرف، رمز عبور و کدهای تایید (پیش از بررسی تراکنش)
+        val isOtpMessage = text.contains("رمز پویا") ||
+                text.contains("رمز یکبار مصرف") ||
+                text.contains("کد تایید") ||
+                text.contains("کد فعالسازی") ||
+                text.contains("رمز دوم") ||
+                text.contains("مرز پویا") ||
+                text.contains("رمز یکبارمصرف") ||
+                text.contains("کد تاییدیه") ||
+                text.contains("کد اعتبارسنجی") ||
+                text.contains("رمز:") ||
+                text.contains("رمز :") ||
+                (text.contains("رمز") && text.contains("مبلغ") && !text.contains("مانده") && !text.contains("موجودی") && !text.contains("پیگیری") && !text.contains("مرجع"))
+
+        if (isOtpMessage) return null
+
+        // بررسی مبلغ منفی همراه با مانده/موجودی (جهت شناسایی تراکنش‌های بدون کلمات کلیدی متنی مثل برداشت/خرید)
+        val hasNegativeAmount = normalizedBody.lines().any { line ->
+            val trimmed = line.trim()
+            trimmed.startsWith("-") || trimmed.contains(Regex("-\\s*[0-9۰-۹,٬]+"))
+        }
+
         // ۱. بررسی کلمات کلیدی تراکنش
         val isExpense = text.contains("برداشت") ||
                 text.contains("خرید") ||
@@ -85,7 +120,9 @@ object SmsParser {
                 text.contains("ساتنا") ||
                 text.contains("پرداخت") ||
                 text.contains("کارمزد") ||
-                text.contains("-")
+                text.contains("بدهکار") ||
+                text.contains("پوز") ||
+                (hasNegativeAmount && (text.contains("مانده") || text.contains("موجودی")))
 
         val isIncome = text.contains("واریز") ||
                 text.contains("سپاس") ||
@@ -103,18 +140,29 @@ object SmsParser {
 
         val amountRegex = Regex("([+-]?\\s*[0-9۰-۹,٬]+)\\s*(ریال|تومان)?")
 
-        // ترجیح ۱: بررسی خطوط مربوط به خود تراکنش (به جز خط مانده حساب)
+        // ترجیح ۱: بررسی خطوط مربوط به خود تراکنش (اطمینان از داشتن کاما، واحد پول، علامت یا کلمه مبلغ برای جلوگیری از خواندن شماره حساب)
         for (line in lines) {
             val lineLower = line.lowercase()
+            if (line.count { it == '.' } >= 2) {
+                continue
+            }
             if (lineLower.contains("مانده") && !lineLower.contains("مبلغ") && !lineLower.contains("+") && !lineLower.contains("-")) {
                 continue
             }
 
             val match = amountRegex.find(line)
             if (match != null) {
-                val valStr = cleanNumber(match.groupValues[1])
+                val rawNumStr = match.groupValues[1]
+                val unitStr = match.groupValues[2]
+                val valStr = cleanNumber(rawNumStr)
                 val valDouble = valStr.toDoubleOrNull() ?: 0.0
-                if (valDouble > 0) {
+
+                val hasComma = rawNumStr.contains(",") || rawNumStr.contains("٬")
+                val hasUnit = !unitStr.isNullOrBlank()
+                val hasSign = rawNumStr.trim().startsWith("+") || rawNumStr.trim().startsWith("-")
+                val hasMablagh = lineLower.contains("مبلغ")
+
+                if (valDouble >= 1000.0 && (hasComma || hasUnit || hasSign || hasMablagh)) {
                     extractedAmount = valDouble
                     break
                 }
@@ -122,12 +170,19 @@ object SmsParser {
         }
 
         // ترجیح ۲: اگر در خطوط بالا پیدا نشد، بررسی کل متن
-        if (extractedAmount == null || extractedAmount <= 0.0) {
+        if (extractedAmount == null) {
             val matches = amountRegex.findAll(normalizedBody)
             for (match in matches) {
-                val valStr = cleanNumber(match.groupValues[1])
+                val rawNumStr = match.groupValues[1]
+                val unitStr = match.groupValues[2]
+                val valStr = cleanNumber(rawNumStr)
                 val valDouble = valStr.toDoubleOrNull() ?: 0.0
-                if (valDouble > 0) {
+
+                val hasComma = rawNumStr.contains(",") || rawNumStr.contains("٬")
+                val hasUnit = !unitStr.isNullOrBlank()
+                val hasSign = rawNumStr.trim().startsWith("+") || rawNumStr.trim().startsWith("-")
+
+                if (valDouble >= 1000.0 && (hasComma || hasUnit || hasSign)) {
                     extractedAmount = valDouble
                     break
                 }
@@ -135,7 +190,6 @@ object SmsParser {
         }
 
         val amount = extractedAmount ?: return null
-        if (amount <= 0.0) return null
 
         // ۳. تعیین دقیق نوع و عنوان تراکنش
         val finalIsIncome = if (text.contains("+") && !text.contains("برداشت")) {
