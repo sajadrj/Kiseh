@@ -68,6 +68,9 @@ object SmsParser {
             text.contains("گردشگری") -> "بانک گردشگری"
             text.contains("پست بانک") -> "پست بانک ایران"
             text.contains("بلو بانک") || text.contains("بلوبانک") || text.contains("blubank") || text.contains("بلو") -> "بلو بانک"
+            text.contains("مفید") || text.contains("کارگزاری مفید") -> "کارگزاری مفید"
+            text.contains("آگاه") || text.contains("کارگزاری آگاه") -> "کارگزاری آگاه"
+            text.contains("کارگزاری") -> "کارگزاری"
 
             // ۲. بررسی نام فرستنده (اگر سرشماره متن باشد یا نام بانک در فرستنده ذکر شده باشد)
             !isSenderNumeric && (senderLower.contains("melli") || senderLower.contains("ملی")) -> "بانک ملی"
@@ -118,24 +121,27 @@ object SmsParser {
             }
         }
 
-        // پاکسازی شماره تلفن‌های ایران (+98... یا 09... یا 989...) از متن جهت جلوگیری از اشتباه در تشخیص کلمات کلیدی یا علامت +
+        // پاکسازی شماره تلفن‌های ایران و عبارات مالی ویژه (مانند قدرت خرید) جهت جلوگیری از اشتباه در تشخیص کلمات کلیدی
         val phoneRegex = Regex("(?:\\+?98|0)?9\\d{9}|\\+98\\d{8,11}")
         val textWithoutPhones = text.replace(phoneRegex, "")
+        val textForKeywordCheck = textWithoutPhones
+            .replace("قدرت خرید", "")
+            .replace("اعتبار خرید", "")
 
         // ۱. بررسی کلمات کلیدی تراکنش
-        val isExpense = textWithoutPhones.contains("برداشت") ||
-                textWithoutPhones.contains("خرید") ||
-                textWithoutPhones.contains("انتقال") ||
-                textWithoutPhones.contains("حواله") ||
-                textWithoutPhones.contains("خروج") ||
-                textWithoutPhones.contains("پایا") ||
-                textWithoutPhones.contains("ساتنا") ||
-                textWithoutPhones.contains("پرداخت") ||
-                textWithoutPhones.contains("کارمزد") ||
-                textWithoutPhones.contains("بدهکار") ||
-                textWithoutPhones.contains("پوز") ||
-                textWithoutPhones.contains("پرید") ||
-                textWithoutPhones.contains("خرج شد") ||
+        val isExpense = textForKeywordCheck.contains("برداشت") ||
+                textForKeywordCheck.contains("خرید") ||
+                textForKeywordCheck.contains("انتقال") ||
+                textForKeywordCheck.contains("حواله") ||
+                textForKeywordCheck.contains("خروج") ||
+                textForKeywordCheck.contains("پایا") ||
+                textForKeywordCheck.contains("ساتنا") ||
+                textForKeywordCheck.contains("پرداخت") ||
+                textForKeywordCheck.contains("کارمزد") ||
+                textForKeywordCheck.contains("بدهکار") ||
+                textForKeywordCheck.contains("پوز") ||
+                textForKeywordCheck.contains("پرید") ||
+                textForKeywordCheck.contains("خرج شد") ||
                 (hasNegativeAmount && (textWithoutPhones.contains("مانده") || textWithoutPhones.contains("موجودی")))
 
         val isIncome = textWithoutPhones.contains("واریز") ||
@@ -146,6 +152,7 @@ object SmsParser {
                 textWithoutPhones.contains("برگشت") ||
                 textWithoutPhones.contains("نشست") ||
                 textWithoutPhones.contains("شارژ شد") ||
+                textWithoutPhones.contains("اضافه شد") ||
                 textWithoutPhones.contains("+")
 
         if (!isExpense && !isIncome) return null
@@ -221,10 +228,10 @@ object SmsParser {
 
         // ۳. تعیین دقیق نوع و عنوان تراکنش
         val finalIsIncome = when {
-            textWithoutPhones.contains("واریز") || textWithoutPhones.contains("بستانکار") || textWithoutPhones.contains("سود") || textWithoutPhones.contains("نشست") || textWithoutPhones.contains("شارژ شد") -> {
-                !textWithoutPhones.contains("برداشت") && !textWithoutPhones.contains("خرید") && !textWithoutPhones.contains("پرید")
+            textWithoutPhones.contains("واریز") || textWithoutPhones.contains("بستانکار") || textWithoutPhones.contains("سود") || textWithoutPhones.contains("نشست") || textWithoutPhones.contains("شارژ شد") || textWithoutPhones.contains("اضافه شد") -> {
+                !textForKeywordCheck.contains("برداشت") && !textForKeywordCheck.contains("خرید") && !textForKeywordCheck.contains("پرید")
             }
-            textWithoutPhones.contains("+") && !textWithoutPhones.contains("برداشت") && !textWithoutPhones.contains("پرید") -> true
+            textWithoutPhones.contains("+") && !textForKeywordCheck.contains("برداشت") && !textForKeywordCheck.contains("پرید") -> true
             else -> isIncome && !isExpense
         }
 
@@ -236,10 +243,10 @@ object SmsParser {
             text.contains("پل") -> "انتقال پل"
             text.contains("کارت به کارت") -> "کارت به کارت"
             text.contains("برگشت") || text.contains("پوزش") -> "برگشت وجه"
-            text.contains("خرید") || text.contains("pos") || (text.contains("پوز") && !text.contains("پوزش")) -> "خرید فروشگاهی"
+            text.contains("سود") -> if (text.contains("کارگزاری") || text.contains("حامی") || text.contains("سرمایه")) "سود سرمایه‌گذاری" else "سود بانکی"
+            textForKeywordCheck.contains("خرید") || text.contains("pos") || (text.contains("پوز") && !text.contains("پوزش")) -> "خرید فروشگاهی"
             text.contains("اینترنتی") || text.contains("درگاه") -> "خرید اینترنتی"
             text.contains("خودپرداز") || text.contains("atm") -> "تراکنش خودپرداز"
-            text.contains("سود") -> "سود بانکی"
             finalIsIncome -> "واریز به حساب"
             else -> "برداشت وجه"
         }
@@ -247,7 +254,7 @@ object SmsParser {
         val category = if (type == "INCOME") {
             when {
                 text.contains("حقوق") || text.contains("دستمزد") -> "حقوق و درآمد"
-                text.contains("سود") || text.contains("سرمایه") -> "سود و سرمایه‌گذاری"
+                text.contains("سود") || text.contains("سرمایه") || text.contains("کارگزاری") || text.contains("حامی") -> "سود و سرمایه‌گذاری"
                 else -> "درآمد و واریزی"
             }
         } else {

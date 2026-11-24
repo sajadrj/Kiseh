@@ -144,4 +144,22 @@ class SmsParserTest {
         assertEquals("INCOME", result.type)
         assertEquals("برگشت وجه", result.title)
     }
+
+    @Test
+    fun testBrokerageMofidProfitParsing() {
+        val sms = """
+            کارگزاری مفید
+            جناب آقای سجاد رجا،
+
+            مبلغ ۱۴,۲۹۹,۶۷۱ ریال بابت سود طرح حامی در آبان ماه(معادل ۲.۶۸ درصد ماهانه و سود موثر سالانه ۳۸ درصد)، به قدرت خرید شما اضافه شد.
+        """.trimIndent()
+
+        val result = SmsParser.parseSms(sms, "مفید")
+        assertNotNull(result)
+        assertEquals(14299671.0, result!!.amount, 0.001)
+        assertEquals("INCOME", result.type)
+        assertEquals("سود سرمایه‌گذاری", result.title)
+        assertEquals("سود و سرمایه‌گذاری", result.category)
+        assertEquals("کارگزاری مفید", result.bankName)
+    }
 }
