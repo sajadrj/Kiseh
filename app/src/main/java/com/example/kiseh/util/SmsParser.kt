@@ -68,6 +68,8 @@ object SmsParser {
             text.contains("گردشگری") -> "بانک گردشگری"
             text.contains("پست بانک") -> "پست بانک ایران"
             text.contains("بلو بانک") || text.contains("بلوبانک") || text.contains("blubank") || text.contains("بلو") -> "بلو بانک"
+            text.contains("دیجی پی") || text.contains("دیجی‌پی") || text.contains("digipay") -> "دیجی پی"
+            text.contains("اسنپ پی") || text.contains("اسنپ‌پی") || text.contains("snapppay") -> "اسنپ پی"
             text.contains("مفید") || text.contains("کارگزاری مفید") -> "کارگزاری مفید"
             text.contains("آگاه") || text.contains("کارگزاری آگاه") -> "کارگزاری آگاه"
             text.contains("کارگزاری") -> "کارگزاری"
@@ -163,13 +165,15 @@ object SmsParser {
 
         val amountRegex = Regex("([+-]?\\s*[0-9۰-۹,٬]+)\\s*(ریال|تومان)?")
 
-        // ترجیح ۱: بررسی خطوط مربوط به خود تراکنش (اطمینان از داشتن کاما، واحد پول، علامت یا کلمه مبلغ برای جلوگیری از خواندن شماره حساب)
+        // ترجیح ۱: بررسی خطوط مربوط به خود تراکنش (اطمینان از داشتن کاما، واحد پول، علامت یا کلمه مبلغ برای جلوگیری از خواندن شماره حساب یا مانده/اعتبار)
         for (line in lines) {
             val lineLower = line.lowercase()
             if (line.count { it == '.' } >= 2) {
                 continue
             }
-            if (lineLower.contains("مانده") && !lineLower.contains("مبلغ") && !lineLower.contains("+") && !lineLower.contains("-")) {
+            val isBalanceOrCreditLine = (lineLower.contains("مانده") || lineLower.contains("موجودی") || lineLower.contains("اعتبار")) &&
+                    !lineLower.contains("مبلغ") && !lineLower.contains("+") && !lineLower.contains("-")
+            if (isBalanceOrCreditLine) {
                 continue
             }
 
@@ -199,28 +203,36 @@ object SmsParser {
             if (extractedAmount != null) break
         }
 
-        // ترجیح ۲: اگر در خطوط بالا پیدا نشد، بررسی کل متن
+        // ترجیح ۲: اگر در خطوط بالا پیدا نشد، بررسی کل متن به جز خطوط مانده/موجودی/اعتبار
         if (extractedAmount == null) {
-            val matches = amountRegex.findAll(normalizedBody)
-            for (match in matches) {
-                val rawNumStr = match.groupValues[1]
-                val unitStr = match.groupValues[2]
-                val valStr = cleanNumber(rawNumStr)
+            for (line in lines) {
+                val lineLower = line.lowercase()
+                val isBalanceOrCreditLine = (lineLower.contains("مانده") || lineLower.contains("موجودی") || lineLower.contains("اعتبار")) &&
+                        !lineLower.contains("مبلغ") && !lineLower.contains("+") && !lineLower.contains("-")
+                if (isBalanceOrCreditLine) continue
 
-                if (isInvalidAmountCandidate(rawNumStr, valStr)) {
-                    continue
+                val matches = amountRegex.findAll(line)
+                for (match in matches) {
+                    val rawNumStr = match.groupValues[1]
+                    val unitStr = match.groupValues[2]
+                    val valStr = cleanNumber(rawNumStr)
+
+                    if (isInvalidAmountCandidate(rawNumStr, valStr)) {
+                        continue
+                    }
+
+                    val valDouble = valStr.toDoubleOrNull() ?: 0.0
+
+                    val hasComma = rawNumStr.contains(",") || rawNumStr.contains("٬")
+                    val hasUnit = unitStr.isNotBlank()
+                    val hasSign = rawNumStr.trim().startsWith("+") || rawNumStr.trim().startsWith("-")
+
+                    if (valDouble >= 1000.0 && (hasComma || hasUnit || hasSign)) {
+                        extractedAmount = valDouble
+                        break
+                    }
                 }
-
-                val valDouble = valStr.toDoubleOrNull() ?: 0.0
-
-                val hasComma = rawNumStr.contains(",") || rawNumStr.contains("٬")
-                val hasUnit = unitStr.isNotBlank()
-                val hasSign = rawNumStr.trim().startsWith("+") || rawNumStr.trim().startsWith("-")
-
-                if (valDouble >= 1000.0 && (hasComma || hasUnit || hasSign)) {
-                    extractedAmount = valDouble
-                    break
-                }
+                if (extractedAmount != null) break
             }
         }
 

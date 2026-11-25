@@ -162,4 +162,15 @@ class SmsParserTest {
         assertEquals("سود و سرمایه‌گذاری", result.category)
         assertEquals("کارگزاری مفید", result.bankName)
     }
+
+    @Test
+    fun testDigiPayCreditStatusSmsIgnored() {
+        val sms = """
+            پرداخت بدهی و شارژ اعتبار دیجی‌پی
+            اعتبار قابل مصرف: ۹۸۱٬۰۴۹٬۶۷۵ ریال
+        """.trimIndent()
+
+        val result = SmsParser.parseSms(sms, "DigiPay")
+        assertNull("DigiPay credit limit status notification without actual transaction amount should be ignored", result)
+    }
 }
